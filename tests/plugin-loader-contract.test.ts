@@ -19,6 +19,14 @@ async function loadDistPlugin(): Promise<unknown> {
 }
 
 describe("OpenCode 1.3.x plugin-loader contract", () => {
+  it("dist/plugin.js imports package.json with a JSON import attribute", () => {
+    const source = readFileSync(new URL("../dist/plugin.js", import.meta.url), "utf-8");
+
+    expect(source).toMatch(
+      /import\s+pkg\s+from\s+["']\.\.\/package\.json["']\s+with\s+\{\s*type:\s*["']json["']\s*\}/
+    );
+  });
+
   it('package.json has an exports["./server"] field', () => {
     const pkg = readPackageJson();
     const exports = pkg["exports"] as Record<string, unknown> | undefined;
