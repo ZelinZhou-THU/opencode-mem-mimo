@@ -6,23 +6,23 @@ const TIMEOUT_MS = 30000;
 const GLOBAL_EMBEDDING_KEY = Symbol.for("opencode-mem.embedding.instance");
 const MAX_CACHE_SIZE = 100;
 
-type XenovaTransformers = typeof import("@xenova/transformers");
+type HfTransformers = typeof import("@huggingface/transformers");
 
 let _transformers: {
-  pipeline: XenovaTransformers["pipeline"];
-  env: XenovaTransformers["env"];
+  pipeline: HfTransformers["pipeline"];
+  env: HfTransformers["env"];
 } | null = null;
 
 function getTransformersPackageSpecifier(): string {
   // Keep this non-literal so OpenCode/Bun plugin-loader bundling does not eagerly
-  // traverse @xenova/transformers internals during plugin startup. The package
+  // traverse @huggingface/transformers internals during plugin startup. The package
   // is only needed for the local embedding backend, and should stay lazy.
-  return ["@xenova", "transformers"].join("/");
+  return ["@huggingface", "transformers"].join("/");
 }
 
 async function ensureTransformersLoaded(): Promise<NonNullable<typeof _transformers>> {
   if (_transformers !== null) return _transformers;
-  const mod = (await import(getTransformersPackageSpecifier())) as XenovaTransformers;
+  const mod = (await import(getTransformersPackageSpecifier())) as HfTransformers;
   mod.env.allowLocalModels = true;
   mod.env.allowRemoteModels = true;
   mod.env.cacheDir = join(CONFIG.storagePath, ".cache");
