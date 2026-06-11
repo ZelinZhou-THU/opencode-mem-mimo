@@ -21,6 +21,13 @@ export async function performAutoCapture(
 ): Promise<void> {
   if (isCaptureRunning) return;
   isCaptureRunning = true;
+  // Tracks the prompt currently held in the captured=2 in-progress state.
+  // Any code path between claimPrompt() and a terminal action (markAsCaptured
+  // or deletePrompt) MUST leave this set so the finally block can release the
+  // lock. Without this, transient failures (no AI response yet, missing
+  // client, LLM error, plugin restart) leave the row stuck at captured=2 and
+  // block all future captures of that prompt.
+  let claimedPromptId: string | null = null;
   try {
     const prompt = userPromptManager.getLastUncapturedPrompt(sessionID);
     if (!prompt) {
@@ -30,6 +37,7 @@ export async function performAutoCapture(
     if (!userPromptManager.claimPrompt(prompt.id)) {
       return;
     }
+    claimedPromptId = prompt.id;
 
     if (!ctx.client) {
       throw new Error("Client not available");
@@ -71,6 +79,7 @@ export async function performAutoCapture(
 
     if (!summaryResult || summaryResult.type === "skip") {
       userPromptManager.deletePrompt(prompt.id);
+      claimedPromptId = null;
       return;
     }
 
@@ -92,6 +101,7 @@ export async function performAutoCapture(
     if (result.success) {
       userPromptManager.linkMemoryToPrompt(prompt.id, result.id);
       userPromptManager.markAsCaptured(prompt.id);
+      claimedPromptId = null;
 
       if (CONFIG.showAutoCaptureToasts) {
         await ctx.client?.tui
@@ -107,6 +117,22 @@ export async function performAutoCapture(
       }
     }
   } finally {
+    // Release any in-progress claim that did not reach a terminal state.
+    // This covers both early returns (no AI response yet, missing client,
+    // empty content) and exceptions (LLM failure, network error). Without
+    // releasing here, the prompt would remain locked at captured=2 with no
+    // automatic recovery path until the next plugin restart.
+    if (claimedPromptId !== null) {
+      try {
+        userPromptManager.releaseClaim(claimedPromptId);
+      } catch (releaseErr) {
+        log(
+          `Failed to release captured=2 claim for prompt ${claimedPromptId}: ${
+            releaseErr instanceof Error ? releaseErr.message : String(releaseErr)
+          }`
+        );
+      }
+    }
     isCaptureRunning = false;
   }
 }
