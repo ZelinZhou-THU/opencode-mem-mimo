@@ -1,7 +1,7 @@
 # opencode-mem-mimo
 
-[![GitHub stars](https://img.shields.io/github/stars/ZelinZhou-THU/opencode-mem-mimo.svg)](https://github.com/ZelinZhou-THU/opencode-mem-mimo/stargazers)
-[![license](https://img.shields.io/github/license/ZelinZhou-THU/opencode-mem-mimo.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/ZelinZhou-THU/opencode-mem-mimo.svg?cacheSeconds=3600)](https://github.com/ZelinZhou-THU/opencode-mem-mimo/stargazers)
+[![license](https://img.shields.io/github/license/ZelinZhou-THU/opencode-mem-mimo.svg?cacheSeconds=3600)](LICENSE)
 [![based on](https://img.shields.io/badge/based%20on-opencode--mem-blue.svg)](https://github.com/tickernelz/opencode-mem)
 [![inspiration](https://img.shields.io/badge/inspiration-MiMo--Code-purple.svg)](https://github.com/XiaomiMiMo/MiMo-Code)
 
