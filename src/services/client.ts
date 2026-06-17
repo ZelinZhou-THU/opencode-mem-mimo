@@ -2,19 +2,24 @@ import { embeddingService } from "./embedding.js";
 import { shardManager } from "./sqlite/shard-manager.js";
 import { vectorSearch } from "./sqlite/vector-search.js";
 import { connectionManager } from "./sqlite/connection-manager.js";
+import { searchFts } from "./sqlite/fts-search.js";
+import type { FtsSearchResult } from "./sqlite/fts-search.js";
 import { CONFIG } from "../config.js";
 import { log } from "./logger.js";
 import type { MemoryType } from "../types/index.js";
 import type { MemoryRecord } from "./sqlite/types.js";
+import { reconcileMarkdown } from "./markdown-memory.js";
 
 export type MemoryScope = "project" | "all-projects";
+
+let lastReconcileAt = 0;
 
 function safeToISOString(timestamp: any): string {
   try {
     if (timestamp === null || timestamp === undefined) {
       return new Date().toISOString();
     }
-    const numValue = typeof timestamp === "bigint" ? Number(timestamp) : Number(timestamp);
+    const numValue = Number(timestamp);
 
     if (isNaN(numValue) || numValue < 0) {
       return new Date().toISOString();
@@ -47,9 +52,11 @@ function extractScopeFromContainerTag(containerTag: string): {
 } {
   const parts = containerTag.split("_");
   if (parts.length >= 3) {
-    const scope = parts[1] as "user" | "project";
-    const hash = parts.slice(2).join("_");
-    return { scope, hash };
+    const scope = parts[1];
+    if (scope === "user" || scope === "project") {
+      const hash = parts.slice(2).join("_");
+      return { scope, hash };
+    }
   }
   return { scope: "user", hash: containerTag };
 }
@@ -116,6 +123,17 @@ export class LocalMemoryClient {
     try {
       await this.initialize();
 
+      if (CONFIG.markdown?.syncOnSearch) {
+        try {
+          if (Date.now() - lastReconcileAt > 30_000) {
+            lastReconcileAt = Date.now();
+            await reconcileMarkdown(undefined, containerTag);
+          }
+        } catch (error) {
+          log("Markdown reconcile skipped", { error: String(error) });
+        }
+      }
+
       const queryVector = await embeddingService.embedWithTimeout(query);
       const resolved = resolveScopeValue(scope, containerTag);
       const shards = shardManager.getAllShards(resolved.scope, resolved.hash);
@@ -124,16 +142,34 @@ export class LocalMemoryClient {
         return { success: true as const, results: [], total: 0, timing: 0 };
       }
 
-      const results = await vectorSearch.searchAcrossShards(
-        shards,
-        queryVector,
-        scope === "all-projects" ? "" : containerTag,
-        CONFIG.maxMemories,
-        CONFIG.similarityThreshold,
-        query
-      );
+      const tagFilter = scope === "all-projects" ? "" : containerTag;
 
-      return { success: true as const, results, total: results.length, timing: 0 };
+      const [vectorResults, ftsResults] = await Promise.all([
+        vectorSearch.searchAcrossShards(
+          shards,
+          queryVector,
+          tagFilter,
+          CONFIG.maxMemories,
+          0,
+          query
+        ),
+        (async () => {
+          const fts: FtsSearchResult[] = [];
+          for (const shard of shards) {
+            try {
+              const db = connectionManager.getConnection(shard.dbPath);
+              fts.push(...searchFts(db, query, tagFilter, CONFIG.maxMemories));
+            } catch (error) {
+              log("FTS search failed for shard", { shardId: shard.id, error: String(error) });
+            }
+          }
+          return fts;
+        })(),
+      ]);
+
+      const fusedResults = fuseSearchResults(vectorResults, ftsResults);
+
+      return { success: true as const, results: fusedResults, total: fusedResults.length, timing: 0 };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       log("searchMemories: error", { error: errorMessage });
@@ -250,12 +286,19 @@ export class LocalMemoryClient {
       // Vector index update (outside transaction — vector backend is async/in-memory)
       try {
         const backend = await (vectorSearch as any).getBackend();
-        await backend.insert({ id: record.id, vector: record.vector, shard, kind: "content" });
         if (record.tagsVector) {
           await backend.insert({ id: record.id, vector: record.tagsVector, shard, kind: "tags" });
         }
+        await backend.insert({ id: record.id, vector: record.vector, shard, kind: "content" });
       } catch (error) {
-        // Rollback SQLite insert on vector backend failure
+        // Rollback SQLite insert and any partial vector inserts on backend failure
+        try {
+          const backend = await (vectorSearch as any).getBackend();
+          if (record.tagsVector) {
+            await backend.delete({ id: record.id, shard, kind: "tags" }).catch(() => {});
+          }
+          await backend.delete({ id: record.id, shard, kind: "content" }).catch(() => {});
+        } catch {}
         db.prepare(`DELETE FROM memories WHERE id = ?`).run(record.id);
         throw error;
       }
@@ -284,6 +327,11 @@ export class LocalMemoryClient {
 
         if (memory) {
           await vectorSearch.deleteVector(db, memoryId, shard);
+          try {
+            db.prepare(`DELETE FROM markdown_sync WHERE memory_id = ?`).run(memoryId);
+          } catch (syncError) {
+            log("deleteMemory: markdown_sync cleanup failed", { memoryId, error: String(syncError) });
+          }
           shardManager.decrementVectorCount(shard.id);
           return { success: true };
         }
@@ -375,7 +423,7 @@ export class LocalMemoryClient {
         allMemories.push(...memories);
       }
 
-      allMemories.sort((a, b) => b.created_at - a.created_at);
+      allMemories.sort((a, b) => Number(b.created_at) - Number(a.created_at));
 
       const results = allMemories.slice(0, limit).map((row: any) => ({
         id: row.id,
@@ -403,3 +451,46 @@ export class LocalMemoryClient {
 }
 
 export const memoryClient = new LocalMemoryClient();
+
+function fuseSearchResults(vectorResults: any[], ftsResults: FtsSearchResult[]): any[] {
+  if (ftsResults.length === 0) return vectorResults;
+
+  const rawMax = ftsResults.reduce((mx, r) => Math.max(mx, r.bm25Score), 0);
+  const maxFts = rawMax > 0 ? rawMax : 1;
+  const normalizedFts = new Map<string, number>();
+  for (const r of ftsResults) {
+    normalizedFts.set(r.id, r.bm25Score / maxFts);
+  }
+
+  const map = new Map<string, any>();
+
+  for (const r of vectorResults) {
+    map.set(r.id, { ...r, vectorScore: r.similarity, ftsScore: normalizedFts.get(r.id) || 0 });
+  }
+
+  for (const r of ftsResults) {
+    if (!map.has(r.id)) {
+      map.set(r.id, {
+        id: r.id,
+        memory: r.content,
+        vectorScore: 0,
+        ftsScore: normalizedFts.get(r.id) || 0,
+        tags: [],
+        metadata: {},
+      });
+    }
+  }
+
+  return Array.from(map.values())
+    .map((r) => {
+      const blended = r.vectorScore * 0.6 + r.ftsScore * 0.4;
+      return {
+        ...r,
+        similarity: r.ftsScore > 0
+          ? Math.max(r.vectorScore, blended)
+          : r.vectorScore,
+      };
+    })
+    .filter((r) => r.similarity > 0)
+    .sort((a, b) => b.similarity - a.similarity);
+}

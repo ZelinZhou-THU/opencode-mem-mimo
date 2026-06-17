@@ -20,7 +20,7 @@
     }
   },
   "scripts": {
-    "build": "bunx tsc && mkdir -p dist/web && cp -r src/web/* dist/web/",
+    "build": "bunx tsc && node -e \"const fs=require('fs');const p=require('path');const cps=(s,d)=>{fs.mkdirSync(d,{recursive:true});for(const e of fs.readdirSync(s)){fs.cpSync(p.join(s,e),p.join(d,e),{recursive:true})}};cps('src/web','dist/web');cps('templates','dist/templates')\"",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.{ts,js,css,html}\"",

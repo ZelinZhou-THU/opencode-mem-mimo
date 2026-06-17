@@ -2,7 +2,7 @@ import { getDatabase } from "./sqlite-bootstrap.js";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { log } from "../logger.js";
-import { CONFIG } from "../../config.js";
+import { initFts, rebuildFtsIndex } from "./fts-search.js";
 
 const Database = getDatabase();
 
@@ -18,6 +18,45 @@ export class ConnectionManager {
     db.run("PRAGMA foreign_keys = ON");
 
     this.migrateSchema(db);
+
+    try {
+      const hasMemories = db
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+        .get();
+      if (hasMemories) {
+        this.initShardExtras(db);
+      }
+    } catch (error) {
+      log("Shard extras init error", { error: String(error) });
+    }
+  }
+
+  private initShardExtras(db: typeof Database.prototype): void {
+    try {
+      db.run(`
+        CREATE TABLE IF NOT EXISTS markdown_sync (
+          path TEXT PRIMARY KEY,
+          fingerprint TEXT NOT NULL,
+          memory_id TEXT NOT NULL,
+          container_tag TEXT NOT NULL,
+          indexed_at INTEGER NOT NULL
+        )
+      `);
+    } catch (error) {
+      log("markdown_sync table creation error", { error: String(error) });
+    }
+
+    try {
+      initFts(db);
+      const count = (db.prepare("SELECT COUNT(*) as c FROM memories").get() as any)?.c ?? 0;
+      const ftsCount = (db.prepare("SELECT COUNT(*) as c FROM memories_fts").get() as any)?.c ?? 0;
+      if (count > 0 && ftsCount === 0) {
+        rebuildFtsIndex(db);
+        log("FTS5 index rebuilt for existing memories", { count });
+      }
+    } catch (error) {
+      log("FTS5 init error", { error: String(error) });
+    }
   }
 
   private migrateSchema(db: typeof Database.prototype): void {

@@ -69,6 +69,7 @@ interface OpenCodeMemConfig {
   compaction?: {
     enabled?: boolean;
     memoryLimit?: number;
+    contextLimit?: number;
   };
   chatMessage?: {
     enabled?: boolean;
@@ -76,6 +77,17 @@ interface OpenCodeMemConfig {
     excludeCurrentSession?: boolean;
     maxAgeDays?: number;
     injectOn?: "first" | "always";
+  };
+  systemPromptInjection?: {
+    enabled?: boolean;
+    tokenBudget?: number;
+    maxResults?: number;
+    minSimilarity?: number;
+  };
+  markdown?: {
+    enabled?: boolean;
+    syncOnSearch?: boolean;
+    autoWrite?: boolean;
   };
 }
 
@@ -151,6 +163,7 @@ const DEFAULTS: Required<
   compaction: {
     enabled: true,
     memoryLimit: 10,
+    contextLimit: 2000,
   },
   chatMessage: {
     enabled: true,
@@ -158,6 +171,17 @@ const DEFAULTS: Required<
     excludeCurrentSession: true,
     maxAgeDays: undefined,
     injectOn: "first",
+  },
+  systemPromptInjection: {
+    enabled: true,
+    tokenBudget: 1500,
+    maxResults: 5,
+    minSimilarity: 0.3,
+  },
+  markdown: {
+    enabled: true,
+    syncOnSearch: true,
+    autoWrite: false,
   },
 };
 
@@ -554,6 +578,7 @@ function buildConfig(fileConfig: OpenCodeMemConfig) {
     compaction: {
       enabled: fileConfig.compaction?.enabled ?? DEFAULTS.compaction.enabled,
       memoryLimit: fileConfig.compaction?.memoryLimit ?? DEFAULTS.compaction.memoryLimit,
+      contextLimit: fileConfig.compaction?.contextLimit ?? DEFAULTS.compaction.contextLimit,
     },
     chatMessage: {
       enabled: fileConfig.chatMessage?.enabled ?? DEFAULTS.chatMessage.enabled,
@@ -564,6 +589,22 @@ function buildConfig(fileConfig: OpenCodeMemConfig) {
       injectOn: (fileConfig.chatMessage?.injectOn ?? DEFAULTS.chatMessage.injectOn) as
         | "first"
         | "always",
+    },
+    systemPromptInjection: {
+      enabled:
+        fileConfig.systemPromptInjection?.enabled ?? DEFAULTS.systemPromptInjection.enabled,
+      tokenBudget:
+        fileConfig.systemPromptInjection?.tokenBudget ?? DEFAULTS.systemPromptInjection.tokenBudget,
+      maxResults:
+        fileConfig.systemPromptInjection?.maxResults ?? DEFAULTS.systemPromptInjection.maxResults,
+      minSimilarity:
+        fileConfig.systemPromptInjection?.minSimilarity ??
+        DEFAULTS.systemPromptInjection.minSimilarity,
+    },
+    markdown: {
+      enabled: fileConfig.markdown?.enabled ?? DEFAULTS.markdown.enabled,
+      syncOnSearch: fileConfig.markdown?.syncOnSearch ?? DEFAULTS.markdown.syncOnSearch,
+      autoWrite: fileConfig.markdown?.autoWrite ?? DEFAULTS.markdown.autoWrite,
     },
   };
 }

@@ -292,11 +292,12 @@ export class VectorSearch {
   getMemoriesBySessionID(db: DatabaseType, sessionID: string): any[] {
     const stmt = db.prepare(`
       SELECT * FROM memories
-      WHERE metadata LIKE ?
+      WHERE metadata LIKE ? ESCAPE '\\'
       ORDER BY created_at DESC
     `);
 
-    const rows = stmt.all(`%"sessionID":"${sessionID}"%`) as any[];
+    const escapedSid = sessionID.replace(/[%_\\"]/g, "\\$&");
+    const rows = stmt.all(`%"sessionID":"${escapedSid}"%`) as any[];
 
     return rows.map((row: any) => ({
       ...row,

@@ -3,7 +3,7 @@ import type { Part } from "@opencode-ai/sdk";
 import { tool } from "@opencode-ai/plugin";
 
 import { memoryClient } from "./services/client.js";
-import { formatContextForPrompt } from "./services/context.js";
+import { formatContextForPrompt, formatSystemPromptMemory } from "./services/context.js";
 import { getTags } from "./services/tags.js";
 import { stripPrivateContent, isFullyPrivate } from "./services/privacy.js";
 import { performAutoCapture } from "./services/auto-capture.js";
@@ -13,6 +13,8 @@ import { startWebServer, WebServer } from "./services/web-server.js";
 
 import { isConfigured, CONFIG, initConfig } from "./config.js";
 import { log } from "./services/logger.js";
+import { ensureAgentsInstalled } from "./services/agent-installer.js";
+import { setProjectDirectory } from "./services/markdown-memory.js";
 import type { MemoryType } from "./types/index.js";
 import { getLanguageName } from "./services/language-detector.js";
 import type { MemoryScope } from "./services/client.js";
@@ -20,11 +22,21 @@ import type { MemoryScope } from "./services/client.js";
 export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
   const { directory } = ctx;
   initConfig(directory);
+  setProjectDirectory(directory);
   const tags = getTags(directory);
   let webServer: WebServer | null = null;
   let idleTimeout: Timer | null = null;
 
-  if (!isConfigured()) {
+  try {
+    const result = ensureAgentsInstalled();
+    if (result.installed.length > 0) {
+      log("Auto-installed dream/distill agents", { files: result.installed });
+    }
+    if (result.updated.length > 0) {
+      log("Updated dream/distill agents", { files: result.updated });
+    }
+  } catch (error) {
+    log("Agent auto-install failed", { error: String(error) });
   }
 
   const GLOBAL_PLUGIN_WARMUP_KEY = Symbol.for("opencode-mem.plugin.warmedup");
@@ -128,26 +140,10 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
       });
   }
 
-  const cleanupPlugin = async () => {
-    if (webServer) await webServer.stop();
-    if (memoryClient) memoryClient.close();
-  };
-
-  const shutdownHandler = async () => {
-    try {
-      await cleanupPlugin();
-      process.exit(0);
-    } catch (error) {
-      log("Shutdown error", { error: String(error) });
-      process.exit(1);
-    }
-  };
-
-  process.on("SIGINT", shutdownHandler);
-  process.on("SIGTERM", shutdownHandler);
   process.on("exit", () => {
-    if (webServer) webServer.stop().catch(() => {});
-    if (memoryClient) memoryClient.close();
+    try {
+      if (memoryClient) memoryClient.close();
+    } catch {}
   });
 
   return {
@@ -246,6 +242,130 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
             })
             .catch(() => {});
         }
+      }
+    },
+
+    "experimental.session.compacting": async (input, output) => {
+      if (!isConfigured() || !CONFIG.compaction.enabled) return;
+
+      try {
+        const messagesResponse = await ctx.client.session.messages({
+          path: { id: input.sessionID },
+        });
+        const messages = messagesResponse.data || [];
+
+        const userTexts = messages
+          .filter((m) => m.info.role === "user")
+          .flatMap((m) =>
+            m.parts
+              .filter((p) => p.type === "text" && !(p as any).synthetic)
+              .map((p) => (p as any).text as string)
+          )
+          .slice(-5)
+          .join(" ");
+
+        let memories: any[] = [];
+
+        if (userTexts.trim()) {
+          const searchResult = await memoryClient.searchMemories(
+            userTexts,
+            tags.project.tag,
+            CONFIG.memory.defaultScope
+          );
+          if (searchResult.success && searchResult.results) {
+            memories = searchResult.results.slice(0, CONFIG.compaction.memoryLimit);
+          }
+        }
+
+        if (memories.length === 0) {
+          const listResult = await memoryClient.listMemories(
+            tags.project.tag,
+            CONFIG.compaction.memoryLimit
+          );
+          memories = listResult.success ? (listResult.memories as any[]) : [];
+        }
+
+        if (memories.length === 0) return;
+
+        const memoryText = memories
+          .map((m: any) => {
+            const content = m.memory || m.summary || "";
+            return `- ${content}`;
+          })
+          .join("\n");
+
+        const contextLimit = CONFIG.compaction.contextLimit || 2000;
+        const truncated =
+          memoryText.length > contextLimit
+            ? memoryText.slice(0, contextLimit) + "\n[... truncated]"
+            : memoryText;
+
+        if (!Array.isArray(output.context)) {
+          log("experimental.session.compacting: output.context is not an array", {});
+          return;
+        }
+
+        output.context.push(
+          `The following are relevant memories from previous sessions. Preserve this knowledge in your summary:\n\n${truncated}`
+        );
+
+        log("Compacting hook injected memories", {
+          sessionID: input.sessionID,
+          count: memories.length,
+        });
+      } catch (error) {
+        log("experimental.session.compacting error", { error: String(error) });
+      }
+    },
+
+    "experimental.chat.system.transform": async (input, output) => {
+      if (!isConfigured() || !CONFIG.systemPromptInjection.enabled) return;
+      if (!input.sessionID) return;
+
+      try {
+        const needsWarmup = !(await memoryClient.isReady());
+        if (needsWarmup) return;
+
+        const messagesResponse = await ctx.client.session.messages({
+          path: { id: input.sessionID },
+        });
+        const messages = messagesResponse.data || [];
+
+        const recentUserTexts = messages
+          .filter((m) => m.info.role === "user")
+          .flatMap((m) =>
+            m.parts
+              .filter((p) => p.type === "text" && !(p as any).synthetic)
+              .map((p) => (p as any).text as string)
+          )
+          .slice(-3)
+          .join(" ");
+
+        if (!recentUserTexts.trim()) return;
+
+        const searchResult = await memoryClient.searchMemories(
+          recentUserTexts,
+          tags.project.tag,
+          CONFIG.memory.defaultScope
+        );
+
+        if (!searchResult.success || !searchResult.results?.length) return;
+
+        const memoryBlock = formatSystemPromptMemory(
+          searchResult.results.slice(0, CONFIG.systemPromptInjection.maxResults || 5),
+          CONFIG.systemPromptInjection.tokenBudget || 1500,
+          CONFIG.systemPromptInjection.minSimilarity || 0.65
+        );
+
+        if (memoryBlock) {
+          if (!Array.isArray(output.system)) {
+            log("experimental.chat.system.transform: output.system is not an array", {});
+            return;
+          }
+          output.system.push(memoryBlock);
+        }
+      } catch (error) {
+        log("experimental.chat.system.transform error", { error: String(error) });
       }
     },
 
@@ -452,7 +572,7 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
               case "list":
                 const listRes = await memoryClient.listMemories(
                   tags.project.tag,
-                  args.limit || 20,
+                  args.limit !== undefined ? args.limit : 20,
                   args.scope ?? CONFIG.memory.defaultScope
                 );
                 if (!listRes.success)
@@ -571,7 +691,7 @@ function formatSearchResults(query: string, results: any, limit?: number): strin
     success: true,
     query,
     count: memoryResults.length,
-    results: memoryResults.slice(0, limit || 10).map((r: any) => ({
+    results: memoryResults.slice(0, limit !== undefined ? limit : 10).map((r: any) => ({
       id: r.id,
       content: r.memory || r.chunk,
       similarity: Math.round(r.similarity * 100),

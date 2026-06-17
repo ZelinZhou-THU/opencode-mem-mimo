@@ -1,10 +1,11 @@
 import { getDatabase } from "./sqlite-bootstrap.js";
 import { join, basename } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import { CONFIG } from "../../config.js";
 import { connectionManager } from "./connection-manager.js";
 import { log } from "../logger.js";
 import { vectorSearch } from "./vector-search.js";
+import { initFts } from "./fts-search.js";
 import type { ShardInfo } from "./types.js";
 
 const Database = getDatabase();
@@ -13,13 +14,19 @@ type DatabaseType = typeof Database.prototype;
 const METADATA_DB_NAME = "metadata.db";
 
 export class ShardManager {
-  private metadataDb: DatabaseType;
-  private metadataPath: string;
+  private _metadataDb: DatabaseType | null = null;
+  private _metadataPath: string | null = null;
 
-  constructor() {
-    this.metadataPath = join(CONFIG.storagePath, METADATA_DB_NAME);
-    this.metadataDb = connectionManager.getConnection(this.metadataPath);
-    this.initMetadataDb();
+  private get metadataPath(): string {
+    return (this._metadataPath ??= join(CONFIG.storagePath, METADATA_DB_NAME));
+  }
+
+  private get metadataDb(): DatabaseType {
+    if (!this._metadataDb) {
+      this._metadataDb = connectionManager.getConnection(this.metadataPath);
+      this.initMetadataDb();
+    }
+    return this._metadataDb;
   }
 
   private initMetadataDb(): void {
@@ -142,15 +149,13 @@ export class ShardManager {
       )
     `);
 
-    db.run(`
-      INSERT OR REPLACE INTO shard_metadata (key, value) 
-      VALUES ('embedding_dimensions', '${CONFIG.embeddingDimensions}')
-    `);
+    db.prepare(
+      `INSERT OR REPLACE INTO shard_metadata (key, value) VALUES (?, ?)`
+    ).run('embedding_dimensions', String(CONFIG.embeddingDimensions));
 
-    db.run(`
-      INSERT OR REPLACE INTO shard_metadata (key, value) 
-      VALUES ('embedding_model', '${CONFIG.embeddingModel}')
-    `);
+    db.prepare(
+      `INSERT OR REPLACE INTO shard_metadata (key, value) VALUES (?, ?)`
+    ).run('embedding_model', CONFIG.embeddingModel);
 
     db.run(`
       CREATE TABLE IF NOT EXISTS memories (
@@ -178,6 +183,22 @@ export class ShardManager {
     db.run(`CREATE INDEX IF NOT EXISTS idx_type ON memories(type)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_created_at ON memories(created_at DESC)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_is_pinned ON memories(is_pinned)`);
+
+    db.run(`
+      CREATE TABLE IF NOT EXISTS markdown_sync (
+        path TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        container_tag TEXT NOT NULL,
+        indexed_at INTEGER NOT NULL
+      )
+    `);
+
+    try {
+      initFts(db);
+    } catch (error) {
+      log("FTS5 init failed during shard creation", { error: String(error) });
+    }
   }
 
   private isShardValid(shard: ShardInfo): boolean {
@@ -205,18 +226,6 @@ export class ShardManager {
         error: String(error),
       });
       return false;
-    }
-  }
-
-  private ensureShardTables(shard: ShardInfo): void {
-    try {
-      const db = connectionManager.getConnection(shard.dbPath);
-      this.initShardDb(db);
-    } catch (error) {
-      log("Error ensuring shard tables", {
-        dbPath: shard.dbPath,
-        error: String(error),
-      });
     }
   }
 
@@ -274,8 +283,11 @@ export class ShardManager {
 
   getShardByPath(dbPath: string): ShardInfo | null {
     const fileName = basename(dbPath);
-    const stmt = this.metadataDb.prepare(`SELECT * FROM shards WHERE db_path LIKE '%' || ?`);
-    const row = stmt.get(fileName) as any;
+    const escaped = fileName.replace(/[%_\\]/g, "\\$&");
+    const stmt = this.metadataDb.prepare(
+      `SELECT * FROM shards WHERE db_path LIKE '%' || ? ESCAPE '\\'`
+    );
+    const row = stmt.get(escaped) as any;
     if (!row) return null;
 
     return {
@@ -309,9 +321,8 @@ export class ShardManager {
       connectionManager.closeConnection(fullPath);
 
       try {
-        const fs = require("node:fs");
-        if (fs.existsSync(fullPath)) {
-          fs.unlinkSync(fullPath);
+        if (existsSync(fullPath)) {
+          unlinkSync(fullPath);
         }
       } catch (error) {
         log("Error deleting shard file", {
