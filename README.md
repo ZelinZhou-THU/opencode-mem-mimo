@@ -1,12 +1,21 @@
-# OpenCode Memory
+# opencode-mem-mimo
 
-[![npm version](https://img.shields.io/npm/v/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
-[![npm downloads](https://img.shields.io/npm/dm/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
-[![license](https://img.shields.io/npm/l/opencode-mem.svg)](https://www.npmjs.com/package/opencode-mem)
+[![GitHub stars](https://img.shields.io/github/stars/ZelinZhou-THU/opencode-mem-mimo.svg)](https://github.com/ZelinZhou-THU/opencode-mem-mimo/stargazers)
+[![license](https://img.shields.io/github/license/ZelinZhou-THU/opencode-mem-mimo.svg)](LICENSE)
+[![based on](https://img.shields.io/badge/based%20on-opencode--mem-blue.svg)](https://github.com/tickernelz/opencode-mem)
+[![inspiration](https://img.shields.io/badge/inspiration-MiMo--Code-purple.svg)](https://github.com/XiaomiMiMo/MiMo-Code)
 
-A persistent memory system for AI coding agents. Long-term context retention across sessions, local-first SQLite storage, hybrid vector + full-text search, and integration with `opencode`'s experimental compaction / system-prompt hooks.
+A persistent memory system for AI coding agents. Long-term context retention across sessions, local-first SQLite storage, hybrid vector + full-text search, knowledge-consolidation subagents, and integration with `opencode`'s experimental compaction / system-prompt hooks.
 
-> **Fork note.** This fork adds (1) FTS5 hybrid search, (2) Markdown dual storage, (3) compaction memory injection, (4) budgeted system-prompt injection, and (5) `dream` / `distill` knowledge-consolidation subagents. See `DEV_REPORT_CN.md` for the full design and review log.
+> **What this fork adds over `tickernelz/opencode-mem`** (MiMo-Code-inspired):
+>
+> 1. **FTS5 hybrid search** — vector + BM25 fused scores, `trigram` tokenizer for CJK support
+> 2. **Markdown dual storage** — `<project>/.opencode/MEMORY.md` and `~/.opencode-mem/global/MEMORY.md` reconciled on every search
+> 3. **Compaction memory injection** — `experimental.session.compacting` hook preserves prior knowledge across compression
+> 4. **Budgeted system-prompt injection** — `experimental.chat.system.transform` hook with token-budgeted, section-aware truncation
+> 5. **`dream` and `distill` subagents** — auto-installed knowledge-consolidation and workflow-distillation agents that query `opencode.db` directly via `bash` + `sqlite3`
+>
+> See `DEV_REPORT_CN.md` for the full design and review log (5 rounds, 62 issues fixed, 34/34 tests pass).
 
 ## Core Features
 
