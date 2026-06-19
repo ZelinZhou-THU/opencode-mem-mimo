@@ -13,7 +13,7 @@ import { startWebServer, WebServer } from "./services/web-server.js";
 
 import { isConfigured, CONFIG, initConfig } from "./config.js";
 import { log } from "./services/logger.js";
-import { ensureAgentsInstalled } from "./services/agent-installer.js";
+import { ensureAgentsInstalled, ensureProjectAgentsMd } from "./services/agent-installer.js";
 import { setProjectDirectory } from "./services/markdown-memory.js";
 import type { MemoryType } from "./types/index.js";
 import { getLanguageName } from "./services/language-detector.js";
@@ -37,6 +37,21 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
     }
   } catch (error) {
     log("Agent auto-install failed", { error: String(error) });
+  }
+
+  if (CONFIG.priming.agentsMd) {
+    try {
+      const mdResult = ensureProjectAgentsMd(directory);
+      if (mdResult.installed) {
+        log("Auto-installed AGENTS.md to project root", { projectRoot: directory });
+      } else if (mdResult.updated) {
+        log("Updated AGENTS.md in project root", { projectRoot: directory });
+      } else if (mdResult.skipped && mdResult.reason && mdResult.reason !== "already up to date") {
+        log("AGENTS.md install skipped", { projectRoot: directory, reason: mdResult.reason });
+      }
+    } catch (error) {
+      log("AGENTS.md auto-install failed", { error: String(error) });
+    }
   }
 
   const GLOBAL_PLUGIN_WARMUP_KEY = Symbol.for("opencode-mem.plugin.warmedup");
@@ -321,10 +336,22 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
     "experimental.chat.system.transform": async (input, output) => {
       if (!isConfigured() || !CONFIG.systemPromptInjection.enabled) return;
       if (!input.sessionID) return;
+      if (!Array.isArray(output.system)) {
+        log("experimental.chat.system.transform: output.system is not an array", {});
+        return;
+      }
 
       try {
         const needsWarmup = !(await memoryClient.isReady());
         if (needsWarmup) return;
+
+        // 1. Always-on usage hint (lightweight, keeps memory tool top-of-mind)
+        if (CONFIG.systemPromptInjection.usageHint) {
+          const langName = getLanguageName(CONFIG.autoCaptureLanguage || "en");
+          output.system.push(
+            `[Memory System]\nYou have a persistent memory tool. Proactively SEARCH (mode=search) before answering technical questions about architecture, conventions, past decisions, or user preferences, and ADD (mode=add) after learning new ones. Match the user's language (${langName}). Do not let hard-won knowledge slip away.`
+          );
+        }
 
         const messagesResponse = await ctx.client.session.messages({
           path: { id: input.sessionID },
@@ -349,20 +376,21 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
           CONFIG.memory.defaultScope
         );
 
-        if (!searchResult.success || !searchResult.results?.length) return;
+        const results = searchResult.success ? searchResult.results || [] : [];
 
         const memoryBlock = formatSystemPromptMemory(
-          searchResult.results.slice(0, CONFIG.systemPromptInjection.maxResults || 5),
+          results.slice(0, CONFIG.systemPromptInjection.maxResults || 5),
           CONFIG.systemPromptInjection.tokenBudget || 1500,
-          CONFIG.systemPromptInjection.minSimilarity || 0.65
+          CONFIG.systemPromptInjection.minSimilarity ?? 0.45
         );
 
         if (memoryBlock) {
-          if (!Array.isArray(output.system)) {
-            log("experimental.chat.system.transform: output.system is not an array", {});
-            return;
-          }
           output.system.push(memoryBlock);
+        } else if (results.length > 0) {
+          // Memories exist but none crossed the similarity threshold — nudge exploration
+          output.system.push(
+            `[Memory] ${results.length} candidate memories exist in this project but none closely matched the current query. Use the memory tool (mode=search) with different keywords to explore.`
+          );
         }
       } catch (error) {
         log("experimental.chat.system.transform error", { error: String(error) });
@@ -371,7 +399,12 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
 
     tool: {
       memory: tool({
-        description: `Manage and query project memory (MATCH USER LANGUAGE: ${getLanguageName(CONFIG.autoCaptureLanguage || "en")}). Use 'search' with technical keywords/tags, 'add' to store knowledge, 'profile' for preferences. Search/list scope: project or all-projects.`,
+        description: `You have a persistent project memory system. Use it PROACTIVELY — do not wait to be asked (MATCH USER LANGUAGE: ${getLanguageName(CONFIG.autoCaptureLanguage || "en")}):
+- SEARCH (mode=search) BEFORE answering questions about project architecture, conventions, past decisions, or user preferences. Query with technical keywords/tags.
+- ADD (mode=add) AFTER you learn a new user preference, project convention, architectural decision, or reusable fact — do not lose hard-won knowledge.
+- PROFILE (mode=profile) to read or write explicit user preferences.
+- LIST (mode=list) to see what is already remembered.
+Scope: project or all-projects.`,
         args: {
           mode: tool.schema.enum(["add", "search", "profile", "list", "forget", "help"]).optional(),
           content: tool.schema.string().optional(),
@@ -415,28 +448,28 @@ export const OpenCodeMemPlugin: Plugin = async (ctx: PluginInput) => {
               case "help":
                 return JSON.stringify({
                   success: true,
-                  message: "Memory System Usage Guide",
+                  message: "Memory System Usage Guide (use proactively)",
                   commands: [
                     {
-                      command: "add",
-                      description: `Store new memory (MATCH USER LANGUAGE: ${langName})`,
-                      args: ["content", "type?", "tags?"],
+                      command: "search",
+                      description: `Search memories BEFORE answering technical questions (MATCH USER LANGUAGE: ${langName})`,
+                      args: ["query"],
                     },
                     {
-                      command: "search",
-                      description: `Search memories via keywords (MATCH USER LANGUAGE: ${langName})`,
-                      args: ["query"],
+                      command: "add",
+                      description: `Store new memory AFTER learning a preference/convention/decision (MATCH USER LANGUAGE: ${langName})`,
+                      args: ["content", "type?", "tags?"],
                     },
                     {
                       command: "profile",
                       description:
-                        "View user profile or save an explicit preference (provide content to write)",
+                        "Read user profile, or save an explicit preference (provide content to write)",
                       args: ["content?"],
                     },
                     { command: "list", description: "List recent memories", args: ["limit?"] },
                     { command: "forget", description: "Remove memory", args: ["memoryId"] },
                   ],
-                  tagGuidance: "Use technical keywords for search. Tags rank highest.",
+                  guidance: "Be proactive: search before answering, add after learning. Use technical keywords for search. Tags rank highest.",
                 });
 
               case "add":

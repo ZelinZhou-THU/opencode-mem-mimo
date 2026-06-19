@@ -83,6 +83,10 @@ interface OpenCodeMemConfig {
     tokenBudget?: number;
     maxResults?: number;
     minSimilarity?: number;
+    usageHint?: boolean;
+  };
+  priming?: {
+    agentsMd?: boolean;
   };
   markdown?: {
     enabled?: boolean;
@@ -176,7 +180,11 @@ const DEFAULTS: Required<
     enabled: true,
     tokenBudget: 1500,
     maxResults: 5,
-    minSimilarity: 0.3,
+    minSimilarity: 0.45,
+    usageHint: true,
+  },
+  priming: {
+    agentsMd: true,
   },
   markdown: {
     enabled: true,
@@ -600,6 +608,11 @@ function buildConfig(fileConfig: OpenCodeMemConfig) {
       minSimilarity:
         fileConfig.systemPromptInjection?.minSimilarity ??
         DEFAULTS.systemPromptInjection.minSimilarity,
+      usageHint:
+        fileConfig.systemPromptInjection?.usageHint ?? DEFAULTS.systemPromptInjection.usageHint,
+    },
+    priming: {
+      agentsMd: fileConfig.priming?.agentsMd ?? DEFAULTS.priming.agentsMd,
     },
     markdown: {
       enabled: fileConfig.markdown?.enabled ?? DEFAULTS.markdown.enabled,
