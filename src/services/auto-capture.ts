@@ -11,6 +11,7 @@ interface ToolCallInfo {
 }
 
 const MAX_TOOL_INPUT_LENGTH = 100;
+const RETRY_BASE_DELAY_MS = 2000;
 
 let isCaptureRunning = false;
 
@@ -21,13 +22,11 @@ export async function performAutoCapture(
 ): Promise<void> {
   if (isCaptureRunning) return;
   isCaptureRunning = true;
-  // Tracks the prompt currently held in the captured=2 in-progress state.
-  // Any code path between claimPrompt() and a terminal action (markAsCaptured
-  // or deletePrompt) MUST leave this set so the finally block can release the
-  // lock. Without this, transient failures (no AI response yet, missing
-  // client, LLM error, plugin restart) leave the row stuck at captured=2 and
-  // block all future captures of that prompt.
+
   let claimedPromptId: string | null = null;
+  const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
+  let attempt = 0;
+
   try {
     const prompt = userPromptManager.getLastUncapturedPrompt(sessionID);
     if (!prompt) {
@@ -38,100 +37,129 @@ export async function performAutoCapture(
       return;
     }
     claimedPromptId = prompt.id;
+    attempt = prompt.capture_attempts || 0;
 
-    if (!ctx.client) {
-      throw new Error("Client not available");
-    }
+    while (attempt < maxRetries) {
+      attempt++;
+      try {
+        if (!ctx.client) {
+          throw new Error("Client not available");
+        }
 
-    const response = await ctx.client.session.messages({
-      path: { id: sessionID },
-    });
+        const response = await ctx.client.session.messages({
+          path: { id: sessionID },
+        });
 
-    if (!response.data) {
-      return;
-    }
+        if (!response.data) {
+          return;
+        }
 
-    const messages = response.data;
+        const messages = response.data;
+        const promptIndex = messages.findIndex((m: any) => m.info?.id === prompt.messageId);
+        if (promptIndex === -1) {
+          return;
+        }
 
-    const promptIndex = messages.findIndex((m: any) => m.info?.id === prompt.messageId);
-    if (promptIndex === -1) {
-      return;
-    }
+        const aiMessages = messages.slice(promptIndex + 1);
+        if (aiMessages.length === 0) {
+          return;
+        }
 
-    const aiMessages = messages.slice(promptIndex + 1);
+        const { textResponses, toolCalls } = extractAIContent(aiMessages);
+        if (textResponses.length === 0 && toolCalls.length === 0) {
+          return;
+        }
 
-    if (aiMessages.length === 0) {
-      return;
-    }
+        const tags = getTags(directory);
+        const latestMemory = await getLatestProjectMemory(tags.project.tag);
+        const context = buildMarkdownContext(
+          prompt.content,
+          textResponses,
+          toolCalls,
+          latestMemory
+        );
 
-    const { textResponses, toolCalls } = extractAIContent(aiMessages);
+        const summaryResult = await generateSummary(context, sessionID, prompt.content);
 
-    if (textResponses.length === 0 && toolCalls.length === 0) {
-      return;
-    }
+        if (!summaryResult || summaryResult.type === "skip") {
+          userPromptManager.deletePrompt(prompt.id);
+          claimedPromptId = null;
+          return;
+        }
 
-    const tags = getTags(directory);
-    const latestMemory = await getLatestProjectMemory(tags.project.tag);
+        const summaryWithTags =
+          summaryResult.tags && summaryResult.tags.length > 0
+            ? `${summaryResult.summary}\n\nTags: ${summaryResult.tags.join(", ")}`
+            : summaryResult.summary;
 
-    const context = buildMarkdownContext(prompt.content, textResponses, toolCalls, latestMemory);
+        const result = await memoryClient.addMemory(summaryWithTags, tags.project.tag, {
+          source: "auto-capture" as any,
+          type: summaryResult.type as any,
+          tags: summaryResult.tags,
+          sessionID,
+          promptId: prompt.id,
+          captureTimestamp: Date.now(),
+          displayName: tags.project.displayName,
+          userName: tags.project.userName,
+          userEmail: tags.project.userEmail,
+          projectPath: tags.project.projectPath,
+          projectName: tags.project.projectName,
+          gitRepoUrl: tags.project.gitRepoUrl,
+        });
 
-    const summaryResult = await generateSummary(context, sessionID, prompt.content);
+        if (result.success) {
+          userPromptManager.linkMemoryToPrompt(prompt.id, result.id);
+          userPromptManager.markAsCaptured(prompt.id);
+          claimedPromptId = null;
 
-    if (!summaryResult || summaryResult.type === "skip") {
-      userPromptManager.deletePrompt(prompt.id);
-      claimedPromptId = null;
-      return;
-    }
+          if (CONFIG.showAutoCaptureToasts) {
+            await ctx.client?.tui
+              .showToast({
+                body: {
+                  title: "Memory Captured",
+                  message: "Project memory saved from conversation",
+                  variant: "success",
+                  duration: 3000,
+                },
+              })
+              .catch(() => {});
+          }
+          return;
+        } else {
+          throw new Error(result.error || "Database persistence failed");
+        }
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
 
-    // Append a "Tags: ..." footer to the summary before persisting. Tags are
-    // already embedded separately into tagsVector, but the contentVector never
-    // sees them. Inlining them here lets the 0.6-weight content channel also
-    // contribute when a query mentions a tag keyword, making recall noticeably
-    // less brittle for precise lookups (e.g. searching for a single API name).
-    const summaryWithTags =
-      summaryResult.tags && summaryResult.tags.length > 0
-        ? `${summaryResult.summary}\n\nTags: ${summaryResult.tags.join(", ")}`
-        : summaryResult.summary;
+        userPromptManager.recordFailedAttempt(prompt.id);
 
-    const result = await memoryClient.addMemory(summaryWithTags, tags.project.tag, {
-      source: "auto-capture" as any,
-      type: summaryResult.type as any,
-      tags: summaryResult.tags,
-      sessionID,
-      promptId: prompt.id,
-      captureTimestamp: Date.now(),
-      displayName: tags.project.displayName,
-      userName: tags.project.userName,
-      userEmail: tags.project.userEmail,
-      projectPath: tags.project.projectPath,
-      projectName: tags.project.projectName,
-      gitRepoUrl: tags.project.gitRepoUrl,
-    });
-
-    if (result.success) {
-      userPromptManager.linkMemoryToPrompt(prompt.id, result.id);
-      userPromptManager.markAsCaptured(prompt.id);
-      claimedPromptId = null;
-
-      if (CONFIG.showAutoCaptureToasts) {
-        await ctx.client?.tui
-          .showToast({
-            body: {
-              title: "Memory Captured",
-              message: "Project memory saved from conversation",
-              variant: "success",
-              duration: 3000,
-            },
-          })
-          .catch(() => {});
+        if (attempt < maxRetries) {
+          log(`Auto-capture warning (attempt ${attempt}/${maxRetries})`, { error: errMsg });
+          await new Promise((resolve) =>
+            setTimeout(resolve, RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1))
+          );
+        } else {
+          throw error;
+        }
       }
     }
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    log(`Auto-capture final error after ${attempt} attempts`, { error: errMsg });
+    if (CONFIG.showErrorToasts) {
+      const shortReason = errMsg.length > 100 ? errMsg.substring(0, 100) + "..." : errMsg;
+      await ctx.client?.tui
+        .showToast({
+          body: {
+            title: "Auto Capture Failed",
+            message: shortReason,
+            variant: "error",
+            duration: 5000,
+          },
+        })
+        .catch(() => {});
+    }
   } finally {
-    // Release any in-progress claim that did not reach a terminal state.
-    // This covers both early returns (no AI response yet, missing client,
-    // empty content) and exceptions (LLM failure, network error). Without
-    // releasing here, the prompt would remain locked at captured=2 with no
-    // automatic recovery path until the next plugin restart.
     if (claimedPromptId !== null) {
       try {
         userPromptManager.releaseClaim(claimedPromptId);
