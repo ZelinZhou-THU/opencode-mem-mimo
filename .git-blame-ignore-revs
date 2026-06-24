@@ -1,0 +1,7 @@
+# Commits that are purely mechanical (dist rebuilds, mass reformats).
+# git blame skips these to surface the last meaningful source change.
+# GitHub respects this file automatically; locally run:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Initial dist commit (compiled output, 170 files)
+0c20b549bb1a7d49482c59819eb81ccd634f6162

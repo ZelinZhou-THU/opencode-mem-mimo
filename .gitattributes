@@ -1,0 +1,2 @@
+# Compiled output — collapse in PR diffs, exclude from language stats
+dist/** linguist-generated=true
