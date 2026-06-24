@@ -63,11 +63,16 @@
     "prettier": "^3.4.2",
     "typescript": "^5.7.3"
   },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.0.0"
+  },
   "opencode": {
     "type": "plugin",
     "hooks": [
       "chat.message",
-      "event"
+      "event",
+      "experimental.chat.system.transform",
+      "experimental.session.compacting"
     ]
   },
   "files": [
