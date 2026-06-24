@@ -50,6 +50,8 @@ Add to your OpenCode configuration at `~/.config/opencode/opencode.json`:
 
 On first load the plugin auto-installs `dream` and `distill` agents/commands into `~/.config/opencode/{agents,commands}/`. The plugin downloads automatically on next startup.
 
+For step-by-step installation with automated verification, see **[INSTALL.md](INSTALL.md)**.
+
 ## Usage Examples
 
 ```typescript
@@ -103,7 +105,11 @@ Configure at `~/.config/opencode/opencode-mem.jsonc`:
     "enabled": true,
     "tokenBudget": 1500,
     "maxResults": 5,
-    "minSimilarity": 0.3
+    "minSimilarity": 0.45,
+    "usageHint": true
+  },
+  "priming": {
+    "agentsMd": true
   },
   "markdown": {
     "enabled": true,
@@ -114,7 +120,6 @@ Configure at `~/.config/opencode/opencode-mem.jsonc`:
     "enabled": true,
     "maxMemories": 3,
     "excludeCurrentSession": true,
-    "maxAgeDays": undefined,
     "injectOn": "first"
   }
 }
@@ -152,7 +157,7 @@ Reconciliation runs on every search (30 s throttle), uses size+mtime fingerprint
 Both hooks depend on `experimental.*` opencode APIs and degrade silently if unavailable.
 
 - `experimental.session.compacting` — injects the top-N most recent memories into the compaction prompt (capped at `compaction.contextLimit` chars).
-- `experimental.chat.system.transform` — injects a token-budgeted `[Relevant Project Memory]` block into the system prompt. Filtered by `systemPromptInjection.minSimilarity` (default `0.3`, suitable for fused scores).
+- `experimental.chat.system.transform` — injects a token-budgeted `[Relevant Project Memory]` block into the system prompt. Filtered by `systemPromptInjection.minSimilarity` (default `0.45`). An always-on `[Memory System]` usage hint is also injected each turn when `systemPromptInjection.usageHint` is `true` (default).
 
 ### `dream` and `distill` Subagents
 
