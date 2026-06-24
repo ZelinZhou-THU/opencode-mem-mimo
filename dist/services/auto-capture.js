@@ -1,0 +1,340 @@
+import { memoryClient } from "./client.js";
+import { getTags } from "./tags.js";
+import { log } from "./logger.js";
+import { CONFIG } from "../config.js";
+import { userPromptManager } from "./user-prompt/user-prompt-manager.js";
+const MAX_TOOL_INPUT_LENGTH = 100;
+let isCaptureRunning = false;
+export async function performAutoCapture(ctx, sessionID, directory) {
+    if (isCaptureRunning)
+        return;
+    isCaptureRunning = true;
+    // Tracks the prompt currently held in the captured=2 in-progress state.
+    // Any code path between claimPrompt() and a terminal action (markAsCaptured
+    // or deletePrompt) MUST leave this set so the finally block can release the
+    // lock. Without this, transient failures (no AI response yet, missing
+    // client, LLM error, plugin restart) leave the row stuck at captured=2 and
+    // block all future captures of that prompt.
+    let claimedPromptId = null;
+    try {
+        const prompt = userPromptManager.getLastUncapturedPrompt(sessionID);
+        if (!prompt) {
+            return;
+        }
+        if (!userPromptManager.claimPrompt(prompt.id)) {
+            return;
+        }
+        claimedPromptId = prompt.id;
+        if (!ctx.client) {
+            throw new Error("Client not available");
+        }
+        const response = await ctx.client.session.messages({
+            path: { id: sessionID },
+        });
+        if (!response.data) {
+            return;
+        }
+        const messages = response.data;
+        const promptIndex = messages.findIndex((m) => m.info?.id === prompt.messageId);
+        if (promptIndex === -1) {
+            return;
+        }
+        const aiMessages = messages.slice(promptIndex + 1);
+        if (aiMessages.length === 0) {
+            return;
+        }
+        const { textResponses, toolCalls } = extractAIContent(aiMessages);
+        if (textResponses.length === 0 && toolCalls.length === 0) {
+            return;
+        }
+        const tags = getTags(directory);
+        const latestMemory = await getLatestProjectMemory(tags.project.tag);
+        const context = buildMarkdownContext(prompt.content, textResponses, toolCalls, latestMemory);
+        const summaryResult = await generateSummary(context, sessionID, prompt.content);
+        if (!summaryResult || summaryResult.type === "skip") {
+            userPromptManager.deletePrompt(prompt.id);
+            claimedPromptId = null;
+            return;
+        }
+        // Append a "Tags: ..." footer to the summary before persisting. Tags are
+        // already embedded separately into tagsVector, but the contentVector never
+        // sees them. Inlining them here lets the 0.6-weight content channel also
+        // contribute when a query mentions a tag keyword, making recall noticeably
+        // less brittle for precise lookups (e.g. searching for a single API name).
+        const summaryWithTags = summaryResult.tags && summaryResult.tags.length > 0
+            ? `${summaryResult.summary}\n\nTags: ${summaryResult.tags.join(", ")}`
+            : summaryResult.summary;
+        const result = await memoryClient.addMemory(summaryWithTags, tags.project.tag, {
+            source: "auto-capture",
+            type: summaryResult.type,
+            tags: summaryResult.tags,
+            sessionID,
+            promptId: prompt.id,
+            captureTimestamp: Date.now(),
+            displayName: tags.project.displayName,
+            userName: tags.project.userName,
+            userEmail: tags.project.userEmail,
+            projectPath: tags.project.projectPath,
+            projectName: tags.project.projectName,
+            gitRepoUrl: tags.project.gitRepoUrl,
+        });
+        if (result.success) {
+            userPromptManager.linkMemoryToPrompt(prompt.id, result.id);
+            userPromptManager.markAsCaptured(prompt.id);
+            claimedPromptId = null;
+            if (CONFIG.showAutoCaptureToasts) {
+                await ctx.client?.tui
+                    .showToast({
+                    body: {
+                        title: "Memory Captured",
+                        message: "Project memory saved from conversation",
+                        variant: "success",
+                        duration: 3000,
+                    },
+                })
+                    .catch(() => { });
+            }
+        }
+    }
+    finally {
+        // Release any in-progress claim that did not reach a terminal state.
+        // This covers both early returns (no AI response yet, missing client,
+        // empty content) and exceptions (LLM failure, network error). Without
+        // releasing here, the prompt would remain locked at captured=2 with no
+        // automatic recovery path until the next plugin restart.
+        if (claimedPromptId !== null) {
+            try {
+                userPromptManager.releaseClaim(claimedPromptId);
+            }
+            catch (releaseErr) {
+                log(`Failed to release captured=2 claim for prompt ${claimedPromptId}: ${releaseErr instanceof Error ? releaseErr.message : String(releaseErr)}`);
+            }
+        }
+        isCaptureRunning = false;
+    }
+}
+function extractAIContent(messages) {
+    const textResponses = [];
+    const toolCalls = [];
+    for (const msg of messages) {
+        if (msg.info?.role !== "assistant")
+            continue;
+        if (!msg.parts || !Array.isArray(msg.parts))
+            continue;
+        const textParts = msg.parts.filter((p) => p.type === "text" && p.text);
+        if (textParts.length > 0) {
+            const text = textParts.map((p) => p.text).join("\n");
+            if (text.trim()) {
+                textResponses.push(text.trim());
+            }
+        }
+        const toolParts = msg.parts.filter((p) => p.type === "tool");
+        for (const tool of toolParts) {
+            const name = tool.tool || "unknown";
+            let input = "";
+            if (tool.state?.input) {
+                const inputObj = tool.state.input;
+                if (typeof inputObj === "string") {
+                    input = inputObj;
+                }
+                else if (typeof inputObj === "object") {
+                    const params = [];
+                    for (const [key, value] of Object.entries(inputObj)) {
+                        params.push(`${key}: ${JSON.stringify(value)}`);
+                    }
+                    input = params.join(", ");
+                }
+            }
+            if (input.length > MAX_TOOL_INPUT_LENGTH) {
+                input = input.substring(0, MAX_TOOL_INPUT_LENGTH) + "...";
+            }
+            toolCalls.push({ name, input });
+        }
+    }
+    return { textResponses, toolCalls };
+}
+async function getLatestProjectMemory(containerTag) {
+    try {
+        const result = await memoryClient.listMemories(containerTag, 1);
+        if (!result.success || result.memories.length === 0) {
+            return null;
+        }
+        const latest = result.memories[0];
+        if (!latest) {
+            return null;
+        }
+        const content = latest.summary;
+        if (content.length <= 500) {
+            return content;
+        }
+        return content.substring(0, 500) + "...";
+    }
+    catch {
+        return null;
+    }
+}
+function buildMarkdownContext(userPrompt, textResponses, toolCalls, latestMemory) {
+    const sections = [];
+    if (latestMemory) {
+        sections.push(`## Previous Memory Context`);
+        sections.push(`---`);
+        sections.push(latestMemory);
+        sections.push(`---\n`);
+    }
+    sections.push(`## User Request`);
+    sections.push(`---`);
+    sections.push(userPrompt);
+    sections.push(`---\n`);
+    if (textResponses.length > 0) {
+        sections.push(`## AI Response`);
+        sections.push(`---`);
+        sections.push(textResponses.join("\n\n"));
+        sections.push(`---\n`);
+    }
+    if (toolCalls.length > 0) {
+        sections.push(`## Tools Used`);
+        sections.push(`---`);
+        for (const tool of toolCalls) {
+            if (tool.input) {
+                sections.push(`- ${tool.name}(${tool.input})`);
+            }
+            else {
+                sections.push(`- ${tool.name}`);
+            }
+        }
+        sections.push(`---\n`);
+    }
+    return sections.join("\n");
+}
+async function generateSummary(context, sessionID, userPrompt) {
+    // Opencode provider path (when opencodeProvider + opencodeModel configured)
+    if (CONFIG.opencodeProvider && CONFIG.opencodeModel) {
+        if (CONFIG.memoryModel) {
+            log("opencodeProvider takes precedence over memoryModel for auto-capture");
+        }
+        const { isProviderConnected, getV2Client, generateStructuredOutput } = await import("./ai/opencode-provider.js");
+        if (!isProviderConnected(CONFIG.opencodeProvider)) {
+            throw new Error(`opencode provider '${CONFIG.opencodeProvider}' is not connected. Check your opencode provider configuration.`);
+        }
+        const v2Client = getV2Client();
+        if (!v2Client) {
+            throw new Error("opencode-mem: v2 client not initialized; cannot perform structured-output capture");
+        }
+        const { detectLanguage, getLanguageName } = await import("./language-detector.js");
+        const targetLang = CONFIG.autoCaptureLanguage === "auto" || !CONFIG.autoCaptureLanguage
+            ? detectLanguage(userPrompt)
+            : CONFIG.autoCaptureLanguage;
+        const langName = getLanguageName(targetLang);
+        const systemPrompt = `You are a technical memory recorder for a software development project.
+
+RULES:
+1. ONLY capture technical work (code, bugs, features, architecture, config)
+2. SKIP non-technical by returning type="skip"
+3. NO meta-commentary or behavior analysis
+4. Include specific file names, functions, technical details
+5. Generate 2-4 technical tags (e.g., "react", "auth", "bug-fix")
+6. You MUST write the summary in ${langName}.
+
+FORMAT:
+## Request
+[1-2 sentences: what was requested, in ${langName}]
+
+## Outcome
+[1-2 sentences: what was done, include files/functions, in ${langName}]
+
+SKIP if: greetings, casual chat, no code/decisions made
+CAPTURE if: code changed, bug fixed, feature added, decision made`;
+        const aiPrompt = `${context}
+
+Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary and relevant tags. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
+        const { z } = await import("zod");
+        const schema = z.object({
+            summary: z.string(),
+            type: z.string(),
+            tags: z.array(z.string()),
+        });
+        const result = await generateStructuredOutput({
+            client: v2Client,
+            providerID: CONFIG.opencodeProvider,
+            modelID: CONFIG.opencodeModel,
+            systemPrompt,
+            userPrompt: aiPrompt,
+            schema,
+        });
+        return {
+            summary: result.summary,
+            type: result.type,
+            tags: (result.tags || []).map((t) => t.toLowerCase().trim()),
+        };
+    }
+    // Existing manual config path
+    if (!CONFIG.memoryModel || !CONFIG.memoryApiUrl) {
+        throw new Error("External API not configured for auto-capture");
+    }
+    const { AIProviderFactory } = await import("./ai/ai-provider-factory.js");
+    const { buildMemoryProviderConfig } = await import("./ai/provider-config.js");
+    const { detectLanguage, getLanguageName } = await import("./language-detector.js");
+    const providerConfig = buildMemoryProviderConfig(CONFIG);
+    const provider = AIProviderFactory.createProvider(CONFIG.memoryProvider, providerConfig);
+    const targetLang = CONFIG.autoCaptureLanguage === "auto" || !CONFIG.autoCaptureLanguage
+        ? detectLanguage(userPrompt)
+        : CONFIG.autoCaptureLanguage;
+    const langName = getLanguageName(targetLang);
+    const systemPrompt = `You are a technical memory recorder for a software development project.
+
+RULES:
+1. ONLY capture technical work (code, bugs, features, architecture, config)
+2. SKIP non-technical by returning type="skip"
+3. NO meta-commentary or behavior analysis
+4. Include specific file names, functions, technical details
+5. Generate 2-4 technical tags (e.g., "react", "auth", "bug-fix")
+6. You MUST write the summary in ${langName}.
+
+FORMAT:
+## Request
+[1-2 sentences: what was requested, in ${langName}]
+
+## Outcome
+[1-2 sentences: what was done, include files/functions, in ${langName}]
+
+SKIP if: greetings, casual chat, no code/decisions made
+CAPTURE if: code changed, bug fixed, feature added, decision made`;
+    const aiPrompt = `${context}
+
+Analyze this conversation. If it contains technical work (code, bugs, features, decisions), create a concise summary and relevant tags. If it's non-technical (greetings, casual chat, incomplete requests), return type="skip" with empty summary.`;
+    const toolSchema = {
+        type: "function",
+        function: {
+            name: "save_memory",
+            description: "Save the conversation summary as a memory",
+            parameters: {
+                type: "object",
+                properties: {
+                    summary: {
+                        type: "string",
+                        description: "Markdown-formatted summary of the conversation",
+                    },
+                    type: {
+                        type: "string",
+                        description: "Type of memory: 'skip' for non-technical conversations, or technical type (feature, bug-fix, refactor, analysis, configuration, discussion, other)",
+                    },
+                    tags: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "List of 2-4 technical tags related to the memory",
+                    },
+                },
+                required: ["summary", "type", "tags"],
+            },
+        },
+    };
+    const result = await provider.executeToolCall(systemPrompt, aiPrompt, toolSchema, sessionID);
+    if (!result.success || !result.data) {
+        throw new Error(result.error || "Failed to generate summary");
+    }
+    return {
+        summary: result.data.summary,
+        type: result.data.type,
+        tags: (result.data.tags || []).map((t) => t.toLowerCase().trim()),
+    };
+}

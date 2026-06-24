@@ -1,0 +1,611 @@
+import { tool } from "@opencode-ai/plugin";
+import { memoryClient } from "./services/client.js";
+import { formatContextForPrompt, formatSystemPromptMemory } from "./services/context.js";
+import { getTags } from "./services/tags.js";
+import { stripPrivateContent, isFullyPrivate } from "./services/privacy.js";
+import { performAutoCapture } from "./services/auto-capture.js";
+import { performUserProfileLearning } from "./services/user-memory-learning.js";
+import { userPromptManager } from "./services/user-prompt/user-prompt-manager.js";
+import { startWebServer, WebServer } from "./services/web-server.js";
+import { isConfigured, CONFIG, initConfig } from "./config.js";
+import { log } from "./services/logger.js";
+import { ensureAgentsInstalled, ensureProjectAgentsMd } from "./services/agent-installer.js";
+import { setProjectDirectory } from "./services/markdown-memory.js";
+import { getLanguageName } from "./services/language-detector.js";
+export const OpenCodeMemPlugin = async (ctx) => {
+    const { directory } = ctx;
+    initConfig(directory);
+    setProjectDirectory(directory);
+    const tags = getTags(directory);
+    let webServer = null;
+    let idleTimeout = null;
+    try {
+        const result = ensureAgentsInstalled();
+        if (result.installed.length > 0) {
+            log("Auto-installed dream/distill agents", { files: result.installed });
+        }
+        if (result.updated.length > 0) {
+            log("Updated dream/distill agents", { files: result.updated });
+        }
+    }
+    catch (error) {
+        log("Agent auto-install failed", { error: String(error) });
+    }
+    if (CONFIG.priming.agentsMd) {
+        try {
+            const mdResult = ensureProjectAgentsMd(directory);
+            if (mdResult.installed) {
+                log("Auto-installed AGENTS.md to project root", { projectRoot: directory });
+            }
+            else if (mdResult.updated) {
+                log("Updated AGENTS.md in project root", { projectRoot: directory });
+            }
+            else if (mdResult.skipped && mdResult.reason && mdResult.reason !== "already up to date") {
+                log("AGENTS.md install skipped", { projectRoot: directory, reason: mdResult.reason });
+            }
+        }
+        catch (error) {
+            log("AGENTS.md auto-install failed", { error: String(error) });
+        }
+    }
+    const GLOBAL_PLUGIN_WARMUP_KEY = Symbol.for("opencode-mem.plugin.warmedup");
+    if (!globalThis[GLOBAL_PLUGIN_WARMUP_KEY] && isConfigured()) {
+        // Fire-and-forget: warmup is slow (embedding model load + index rebuild).
+        // Awaiting it here serializes opencode's plugin loader and starves the TUI,
+        // which gave the symptom "opencode hangs ~70s then disconnects on startup".
+        (async () => {
+            try {
+                await memoryClient.warmup();
+                globalThis[GLOBAL_PLUGIN_WARMUP_KEY] = true;
+            }
+            catch (error) {
+                log("Plugin warmup failed", { error: String(error) });
+            }
+        })();
+    }
+    (async () => {
+        try {
+            const { setConnectedProviders, setV2Client, createV2Client } = await import("./services/ai/opencode-provider.js");
+            setV2Client(createV2Client(ctx.serverUrl));
+            const providerResult = await ctx.client.provider.list();
+            if (providerResult.data?.connected) {
+                setConnectedProviders(providerResult.data.connected);
+            }
+        }
+        catch (error) {
+            log("Failed to initialize opencode provider state", { error: String(error) });
+        }
+    })();
+    if (CONFIG.webServerEnabled) {
+        startWebServer({
+            port: CONFIG.webServerPort,
+            host: CONFIG.webServerHost,
+            enabled: CONFIG.webServerEnabled,
+        })
+            .then((server) => {
+            webServer = server;
+            const url = webServer.getUrl();
+            webServer.setOnTakeoverCallback(async () => {
+                if (ctx.client?.tui) {
+                    ctx.client.tui
+                        .showToast({
+                        body: {
+                            title: "Memory Explorer",
+                            message: "Took over web server ownership",
+                            variant: "success",
+                            duration: 3000,
+                        },
+                    })
+                        .catch(() => { });
+                }
+            });
+            if (webServer.isServerOwner()) {
+                if (ctx.client?.tui) {
+                    ctx.client.tui
+                        .showToast({
+                        body: {
+                            title: "Memory Explorer",
+                            message: `Web UI started at ${url}`,
+                            variant: "success",
+                            duration: 5000,
+                        },
+                    })
+                        .catch(() => { });
+                }
+            }
+            else {
+                if (ctx.client?.tui) {
+                    ctx.client.tui
+                        .showToast({
+                        body: {
+                            title: "Memory Explorer",
+                            message: `Web UI available at ${url}`,
+                            variant: "info",
+                            duration: 3000,
+                        },
+                    })
+                        .catch(() => { });
+                }
+            }
+        })
+            .catch((error) => {
+            log("Web server failed to start", { error: String(error) });
+            if (ctx.client?.tui) {
+                ctx.client.tui
+                    .showToast({
+                    body: {
+                        title: "Memory Explorer Error",
+                        message: `Failed to start: ${String(error)}`,
+                        variant: "error",
+                        duration: 5000,
+                    },
+                })
+                    .catch(() => { });
+            }
+        });
+    }
+    process.on("exit", () => {
+        try {
+            if (memoryClient)
+                memoryClient.close();
+        }
+        catch { }
+    });
+    return {
+        "chat.message": async (input, output) => {
+            if (!isConfigured() || !CONFIG.chatMessage.enabled)
+                return;
+            try {
+                const textParts = output.parts.filter((p) => p.type === "text");
+                if (textParts.length === 0)
+                    return;
+                const userMessage = textParts.map((p) => p.text).join("\n");
+                if (!userMessage.trim())
+                    return;
+                userPromptManager.savePrompt(input.sessionID, output.message.id, directory, userMessage);
+                const messagesResponse = await ctx.client.session.messages({
+                    path: { id: input.sessionID },
+                });
+                const messages = messagesResponse.data || [];
+                const hasNonSyntheticUserMessages = messages.some((m) => m.info.role === "user" &&
+                    !m.parts.every((p) => p.type !== "text" || p.synthetic === true));
+                const lastMessage = messages.length > 0 ? messages[messages.length - 1] : null;
+                const isAfterCompaction = lastMessage?.info?.summary === true;
+                const shouldInject = CONFIG.chatMessage.injectOn === "always" ||
+                    !hasNonSyntheticUserMessages ||
+                    (isAfterCompaction &&
+                        messages.filter((m) => m.info.role === "user" &&
+                            !m.parts.every((p) => p.type !== "text" || p.synthetic === true)).length === 1);
+                if (!shouldInject)
+                    return;
+                const listResult = await memoryClient.listMemories(tags.project.tag, CONFIG.chatMessage.maxMemories);
+                let memories = listResult.success ? listResult.memories : [];
+                if (CONFIG.chatMessage.excludeCurrentSession) {
+                    memories = memories.filter((m) => m.metadata?.sessionID !== input.sessionID);
+                }
+                if (CONFIG.chatMessage.maxAgeDays) {
+                    const cutoffDate = Date.now() - CONFIG.chatMessage.maxAgeDays * 86400000;
+                    memories = memories.filter((m) => new Date(m.createdAt).getTime() > cutoffDate);
+                }
+                if (memories.length === 0)
+                    return;
+                const projectMemories = {
+                    results: memories.map((m) => ({
+                        similarity: 1.0,
+                        memory: m.summary,
+                    })),
+                    total: memories.length,
+                    timing: 0,
+                };
+                const userId = tags.user.userEmail || null;
+                const memoryContext = formatContextForPrompt(userId, projectMemories);
+                if (memoryContext) {
+                    const contextPart = {
+                        id: `prt-memory-context-${Date.now()}`,
+                        sessionID: input.sessionID,
+                        messageID: output.message.id,
+                        type: "text",
+                        text: memoryContext,
+                        synthetic: true,
+                    };
+                    output.parts.unshift(contextPart);
+                }
+            }
+            catch (error) {
+                log("chat.message: ERROR", { error: String(error) });
+                if (ctx.client?.tui && CONFIG.showErrorToasts) {
+                    await ctx.client.tui
+                        .showToast({
+                        body: {
+                            title: "Memory System Error",
+                            message: String(error),
+                            variant: "error",
+                            duration: 5000,
+                        },
+                    })
+                        .catch(() => { });
+                }
+            }
+        },
+        "experimental.session.compacting": async (input, output) => {
+            if (!isConfigured() || !CONFIG.compaction.enabled)
+                return;
+            try {
+                const messagesResponse = await ctx.client.session.messages({
+                    path: { id: input.sessionID },
+                });
+                const messages = messagesResponse.data || [];
+                const userTexts = messages
+                    .filter((m) => m.info.role === "user")
+                    .flatMap((m) => m.parts
+                    .filter((p) => p.type === "text" && !p.synthetic)
+                    .map((p) => p.text))
+                    .slice(-5)
+                    .join(" ");
+                let memories = [];
+                if (userTexts.trim()) {
+                    const searchResult = await memoryClient.searchMemories(userTexts, tags.project.tag, CONFIG.memory.defaultScope);
+                    if (searchResult.success && searchResult.results) {
+                        memories = searchResult.results.slice(0, CONFIG.compaction.memoryLimit);
+                    }
+                }
+                if (memories.length === 0) {
+                    const listResult = await memoryClient.listMemories(tags.project.tag, CONFIG.compaction.memoryLimit);
+                    memories = listResult.success ? listResult.memories : [];
+                }
+                if (memories.length === 0)
+                    return;
+                const memoryText = memories
+                    .map((m) => {
+                    const content = m.memory || m.summary || "";
+                    return `- ${content}`;
+                })
+                    .join("\n");
+                const contextLimit = CONFIG.compaction.contextLimit || 2000;
+                const truncated = memoryText.length > contextLimit
+                    ? memoryText.slice(0, contextLimit) + "\n[... truncated]"
+                    : memoryText;
+                if (!Array.isArray(output.context)) {
+                    log("experimental.session.compacting: output.context is not an array", {});
+                    return;
+                }
+                output.context.push(`The following are relevant memories from previous sessions. Preserve this knowledge in your summary:\n\n${truncated}`);
+                log("Compacting hook injected memories", {
+                    sessionID: input.sessionID,
+                    count: memories.length,
+                });
+            }
+            catch (error) {
+                log("experimental.session.compacting error", { error: String(error) });
+            }
+        },
+        "experimental.chat.system.transform": async (input, output) => {
+            if (!isConfigured() || !CONFIG.systemPromptInjection.enabled)
+                return;
+            if (!input.sessionID)
+                return;
+            if (!Array.isArray(output.system)) {
+                log("experimental.chat.system.transform: output.system is not an array", {});
+                return;
+            }
+            try {
+                const needsWarmup = !(await memoryClient.isReady());
+                if (needsWarmup)
+                    return;
+                // 1. Always-on usage hint (lightweight, keeps memory tool top-of-mind)
+                if (CONFIG.systemPromptInjection.usageHint) {
+                    const langName = getLanguageName(CONFIG.autoCaptureLanguage || "en");
+                    output.system.push(`[Memory System]\nYou have a persistent memory tool. Proactively SEARCH (mode=search) before answering technical questions about architecture, conventions, past decisions, or user preferences, and ADD (mode=add) after learning new ones. Match the user's language (${langName}). Do not let hard-won knowledge slip away.`);
+                }
+                const messagesResponse = await ctx.client.session.messages({
+                    path: { id: input.sessionID },
+                });
+                const messages = messagesResponse.data || [];
+                const recentUserTexts = messages
+                    .filter((m) => m.info.role === "user")
+                    .flatMap((m) => m.parts
+                    .filter((p) => p.type === "text" && !p.synthetic)
+                    .map((p) => p.text))
+                    .slice(-3)
+                    .join(" ");
+                if (!recentUserTexts.trim())
+                    return;
+                const searchResult = await memoryClient.searchMemories(recentUserTexts, tags.project.tag, CONFIG.memory.defaultScope);
+                const results = searchResult.success ? searchResult.results || [] : [];
+                const memoryBlock = formatSystemPromptMemory(results.slice(0, CONFIG.systemPromptInjection.maxResults || 5), CONFIG.systemPromptInjection.tokenBudget || 1500, CONFIG.systemPromptInjection.minSimilarity ?? 0.45);
+                if (memoryBlock) {
+                    output.system.push(memoryBlock);
+                }
+                else if (results.length > 0) {
+                    // Memories exist but none crossed the similarity threshold — nudge exploration
+                    output.system.push(`[Memory] ${results.length} candidate memories exist in this project but none closely matched the current query. Use the memory tool (mode=search) with different keywords to explore.`);
+                }
+            }
+            catch (error) {
+                log("experimental.chat.system.transform error", { error: String(error) });
+            }
+        },
+        tool: {
+            memory: tool({
+                description: `You have a persistent project memory system. Use it PROACTIVELY — do not wait to be asked (MATCH USER LANGUAGE: ${getLanguageName(CONFIG.autoCaptureLanguage || "en")}):
+- SEARCH (mode=search) BEFORE answering questions about project architecture, conventions, past decisions, or user preferences. Query with technical keywords/tags.
+- ADD (mode=add) AFTER you learn a new user preference, project convention, architectural decision, or reusable fact — do not lose hard-won knowledge.
+- PROFILE (mode=profile) to read or write explicit user preferences.
+- LIST (mode=list) to see what is already remembered.
+Scope: project or all-projects.`,
+                args: {
+                    mode: tool.schema.enum(["add", "search", "profile", "list", "forget", "help"]).optional(),
+                    content: tool.schema.string().optional(),
+                    query: tool.schema.string().optional(),
+                    tags: tool.schema.string().optional(),
+                    type: tool.schema.string().optional(),
+                    memoryId: tool.schema.string().optional(),
+                    limit: tool.schema.number().optional(),
+                    scope: tool.schema.enum(["project", "all-projects"]).optional(),
+                },
+                async execute(args, toolCtx) {
+                    if (!isConfigured()) {
+                        return JSON.stringify({
+                            success: false,
+                            error: "Memory system not configured properly.",
+                        });
+                    }
+                    const needsWarmup = !(await memoryClient.isReady());
+                    if (needsWarmup) {
+                        return JSON.stringify({ success: false, error: "Memory system is initializing." });
+                    }
+                    const mode = args.mode || "help";
+                    const langName = getLanguageName(CONFIG.autoCaptureLanguage || "en");
+                    try {
+                        switch (mode) {
+                            case "help":
+                                return JSON.stringify({
+                                    success: true,
+                                    message: "Memory System Usage Guide (use proactively)",
+                                    commands: [
+                                        {
+                                            command: "search",
+                                            description: `Search memories BEFORE answering technical questions (MATCH USER LANGUAGE: ${langName})`,
+                                            args: ["query"],
+                                        },
+                                        {
+                                            command: "add",
+                                            description: `Store new memory AFTER learning a preference/convention/decision (MATCH USER LANGUAGE: ${langName})`,
+                                            args: ["content", "type?", "tags?"],
+                                        },
+                                        {
+                                            command: "profile",
+                                            description: "Read user profile, or save an explicit preference (provide content to write)",
+                                            args: ["content?"],
+                                        },
+                                        { command: "list", description: "List recent memories", args: ["limit?"] },
+                                        { command: "forget", description: "Remove memory", args: ["memoryId"] },
+                                    ],
+                                    guidance: "Be proactive: search before answering, add after learning. Use technical keywords for search. Tags rank highest.",
+                                });
+                            case "add":
+                                if (!args.content)
+                                    return JSON.stringify({ success: false, error: "content required" });
+                                const sanitizedContent = stripPrivateContent(args.content);
+                                if (isFullyPrivate(args.content))
+                                    return JSON.stringify({ success: false, error: "Private content blocked" });
+                                const tagInfo = tags.project;
+                                const parsedTags = args.tags
+                                    ? args.tags.split(",").map((t) => t.trim().toLowerCase())
+                                    : undefined;
+                                const result = await memoryClient.addMemory(sanitizedContent, tagInfo.tag, {
+                                    type: args.type,
+                                    tags: parsedTags,
+                                    displayName: tagInfo.displayName,
+                                    userName: tagInfo.userName,
+                                    userEmail: tagInfo.userEmail,
+                                    projectPath: tagInfo.projectPath,
+                                    projectName: tagInfo.projectName,
+                                    gitRepoUrl: tagInfo.gitRepoUrl,
+                                });
+                                return JSON.stringify({
+                                    success: result.success,
+                                    message: `Memory added`,
+                                    id: result.id,
+                                    tags: parsedTags,
+                                });
+                            case "search":
+                                if (!args.query)
+                                    return JSON.stringify({ success: false, error: "query required" });
+                                const searchRes = await memoryClient.searchMemories(args.query, tags.project.tag, args.scope ?? CONFIG.memory.defaultScope);
+                                if (!searchRes.success)
+                                    return JSON.stringify({ success: false, error: searchRes.error });
+                                return formatSearchResults(args.query, searchRes, args.limit);
+                            case "profile": {
+                                if (args.query) {
+                                    return JSON.stringify({
+                                        success: false,
+                                        error: "query is not valid for profile mode. Use content to write a preference or omit all args to read.",
+                                    });
+                                }
+                                const { userProfileManager } = await import("./services/user-profile/user-profile-manager.js");
+                                const userId = tags.user.userEmail || "unknown";
+                                // --- WRITE: explicit preference ---
+                                if (args.content !== undefined) {
+                                    const trimmed = args.content.trim();
+                                    if (!trimmed) {
+                                        return JSON.stringify({ success: false, error: "content must not be blank" });
+                                    }
+                                    if (!tags.user.userEmail) {
+                                        return JSON.stringify({
+                                            success: false,
+                                            error: "Cannot save profile preference because no user email could be resolved. Configure userEmailOverride or git user.email.",
+                                        });
+                                    }
+                                    const sanitizedContent = stripPrivateContent(trimmed);
+                                    const hasNonPrivateContent = sanitizedContent.replace(/\[REDACTED\]/g, "").trim().length > 0;
+                                    if (isFullyPrivate(trimmed) || !hasNonPrivateContent) {
+                                        return JSON.stringify({ success: false, error: "Private content blocked" });
+                                    }
+                                    const newPreference = {
+                                        category: "explicit",
+                                        description: sanitizedContent,
+                                        confidence: 1.0,
+                                        evidence: ["manual-write"],
+                                        lastUpdated: Date.now(),
+                                    };
+                                    const existingProfile = userProfileManager.getActiveProfile(userId);
+                                    if (existingProfile) {
+                                        const existingData = JSON.parse(existingProfile.profileData);
+                                        const mergedData = userProfileManager.mergeProfileData(existingData, {
+                                            preferences: [newPreference],
+                                        });
+                                        userProfileManager.updateProfile(existingProfile.id, mergedData, 0, `Explicit preference added: ${sanitizedContent.slice(0, 80)}`);
+                                        return JSON.stringify({
+                                            success: true,
+                                            message: "Preference saved to profile",
+                                        });
+                                    }
+                                    else {
+                                        userProfileManager.createProfile(userId, tags.user.displayName || userId, tags.user.userName || userId, tags.user.userEmail || userId, { preferences: [newPreference], patterns: [], workflows: [] }, 0);
+                                        return JSON.stringify({
+                                            success: true,
+                                            message: "Profile created with preference",
+                                        });
+                                    }
+                                }
+                                // --- READ: no content provided ---
+                                const profile = userProfileManager.getActiveProfile(userId);
+                                if (!profile)
+                                    return JSON.stringify({ success: true, profile: null });
+                                const pData = JSON.parse(profile.profileData);
+                                return JSON.stringify({
+                                    success: true,
+                                    profile: {
+                                        ...pData,
+                                        version: profile.version,
+                                        lastAnalyzed: profile.lastAnalyzedAt,
+                                    },
+                                });
+                            }
+                            case "list":
+                                const listRes = await memoryClient.listMemories(tags.project.tag, args.limit !== undefined ? args.limit : 20, args.scope ?? CONFIG.memory.defaultScope);
+                                if (!listRes.success)
+                                    return JSON.stringify({ success: false, error: listRes.error });
+                                return JSON.stringify({
+                                    success: true,
+                                    count: listRes.memories?.length,
+                                    memories: listRes.memories?.map((m) => ({
+                                        id: m.id,
+                                        content: m.summary,
+                                        createdAt: m.createdAt,
+                                    })),
+                                });
+                            case "forget":
+                                if (!args.memoryId)
+                                    return JSON.stringify({ success: false, error: "memoryId required" });
+                                const delRes = await memoryClient.deleteMemory(args.memoryId);
+                                return JSON.stringify({ success: delRes.success, message: `Memory removed` });
+                            default:
+                                return JSON.stringify({ success: false, error: `Unknown mode: ${mode}` });
+                        }
+                    }
+                    catch (error) {
+                        return JSON.stringify({ success: false, error: String(error) });
+                    }
+                },
+            }),
+        },
+        event: async (input) => {
+            const event = input.event;
+            if (event.type === "session.idle") {
+                if (!isConfigured() || !CONFIG.autoCaptureEnabled)
+                    return;
+                const sessionID = event.properties?.sessionID;
+                if (!sessionID)
+                    return;
+                if (idleTimeout)
+                    clearTimeout(idleTimeout);
+                idleTimeout = setTimeout(async () => {
+                    try {
+                        await performAutoCapture(ctx, sessionID, directory);
+                        if (webServer?.isServerOwner()) {
+                            await performUserProfileLearning(ctx, directory);
+                            const { cleanupService } = await import("./services/cleanup-service.js");
+                            if (await cleanupService.shouldRunCleanup())
+                                await cleanupService.runCleanup();
+                            const { connectionManager } = await import("./services/sqlite/connection-manager.js");
+                            connectionManager.checkpointAll();
+                        }
+                    }
+                    catch (error) {
+                        log("Idle processing error", { error: String(error) });
+                    }
+                    finally {
+                        idleTimeout = null;
+                    }
+                }, 10000);
+            }
+            if (event.type === "session.compacted") {
+                if (!isConfigured() || !CONFIG.compaction.enabled)
+                    return;
+                const sessionID = event.properties?.sessionID;
+                if (!sessionID)
+                    return;
+                try {
+                    const tags = getTags(directory);
+                    const memoriesResult = await memoryClient.searchMemoriesBySessionID(sessionID, tags.project.tag, CONFIG.compaction.memoryLimit);
+                    if (!memoriesResult.success || memoriesResult.results.length === 0) {
+                        return;
+                    }
+                    const memoryContext = formatMemoriesForCompaction(memoriesResult.results);
+                    await ctx.client.session.prompt({
+                        path: { id: sessionID },
+                        body: {
+                            parts: [{ id: `prt-compaction-${Date.now()}`, type: "text", text: memoryContext }],
+                            noReply: true,
+                        },
+                    });
+                    if (ctx.client?.tui) {
+                        await ctx.client.tui
+                            .showToast({
+                            body: {
+                                title: "Memory Restored",
+                                message: `${memoriesResult.results.length} memories injected after compaction`,
+                                variant: "success",
+                                duration: 3000,
+                            },
+                        })
+                            .catch(() => { });
+                    }
+                    log("Compaction memory injected", {
+                        sessionID,
+                        count: memoriesResult.results.length,
+                    });
+                }
+                catch (error) {
+                    log("Compaction handler error", { error: String(error) });
+                }
+            }
+        },
+    };
+};
+function formatSearchResults(query, results, limit) {
+    const memoryResults = results.results || [];
+    return JSON.stringify({
+        success: true,
+        query,
+        count: memoryResults.length,
+        results: memoryResults.slice(0, limit !== undefined ? limit : 10).map((r) => ({
+            id: r.id,
+            content: r.memory || r.chunk,
+            similarity: Math.round(r.similarity * 100),
+        })),
+    });
+}
+function formatMemoriesForCompaction(memories) {
+    let output = `## Restored Session Memory\n\n`;
+    memories.forEach((m, i) => {
+        output += `### Memory ${i + 1}\n`;
+        output += `${m.memory}\n\n`;
+        if (m.tags && m.tags.length > 0) {
+            output += `Tags: ${m.tags.join(", ")}\n\n`;
+        }
+    });
+    return output;
+}
