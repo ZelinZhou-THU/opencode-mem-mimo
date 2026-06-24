@@ -14,6 +14,7 @@ export declare let CONFIG: {
     autoCaptureEnabled: boolean;
     autoCaptureMaxIterations: number;
     autoCaptureIterationTimeout: number;
+    autoCaptureMaxRetries: number;
     autoCaptureLanguage: string | undefined;
     memoryProvider: "openai-chat" | "openai-responses" | "anthropic";
     memoryModel: string | undefined;

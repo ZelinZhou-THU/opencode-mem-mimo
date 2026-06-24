@@ -21,11 +21,20 @@ export class UserPromptManager {
         project_path TEXT,
         content TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        captured BOOLEAN DEFAULT 0,
+        captured INTEGER DEFAULT 0,
         user_learning_captured BOOLEAN DEFAULT 0,
-        linked_memory_id TEXT
+        linked_memory_id TEXT,
+        capture_attempts INTEGER DEFAULT 0
       )
     `);
+        try {
+            this.db.run("ALTER TABLE user_prompts ADD COLUMN capture_attempts INTEGER DEFAULT 0");
+        }
+        catch (error) {
+            if (!error.message.includes("duplicate column name")) {
+                console.warn("Failed to add capture_attempts column:", error.message);
+            }
+        }
         this.db.run("UPDATE user_prompts SET captured = 0 WHERE captured = 2");
         this.db.run("CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(session_id)");
         this.db.run("CREATE INDEX IF NOT EXISTS idx_user_prompts_captured ON user_prompts(captured)");
@@ -45,13 +54,14 @@ export class UserPromptManager {
         return id;
     }
     getLastUncapturedPrompt(sessionId) {
+        const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
         const stmt = this.db.prepare(`
       SELECT * FROM user_prompts 
-      WHERE session_id = ? AND captured = 0
+      WHERE session_id = ? AND captured = 0 AND capture_attempts < ?
       ORDER BY created_at DESC 
       LIMIT 1
     `);
-        const row = stmt.get(sessionId);
+        const row = stmt.get(sessionId, maxRetries);
         if (!row)
             return null;
         return this.rowToPrompt(row);
@@ -69,6 +79,10 @@ export class UserPromptManager {
         const result = stmt.run(promptId);
         return result.changes > 0;
     }
+    recordFailedAttempt(promptId) {
+        const stmt = this.db.prepare(`UPDATE user_prompts SET capture_attempts = capture_attempts + 1 WHERE id = ?`);
+        stmt.run(promptId);
+    }
     /**
      * Release a previously claimed prompt back to the pending state so it can
      * be retried by a future capture cycle. Used when capture aborts before
@@ -84,18 +98,20 @@ export class UserPromptManager {
         return result.changes > 0;
     }
     countUncapturedPrompts() {
-        const stmt = this.db.prepare(`SELECT COUNT(*) as count FROM user_prompts WHERE captured = 0`);
-        const row = stmt.get();
+        const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
+        const stmt = this.db.prepare(`SELECT COUNT(*) as count FROM user_prompts WHERE captured = 0 AND capture_attempts < ?`);
+        const row = stmt.get(maxRetries);
         return row?.count || 0;
     }
     getUncapturedPrompts(limit) {
+        const maxRetries = CONFIG.autoCaptureMaxRetries ?? 3;
         const stmt = this.db.prepare(`
       SELECT * FROM user_prompts 
-      WHERE captured = 0 
-      ORDER BY created_at ASC 
+      WHERE captured = 0 AND capture_attempts < ?
+      ORDER BY capture_attempts ASC, created_at ASC 
       LIMIT ?
     `);
-        const rows = stmt.all(limit);
+        const rows = stmt.all(maxRetries, limit);
         return rows.map((row) => this.rowToPrompt(row));
     }
     markMultipleAsCaptured(promptIds) {
@@ -200,6 +216,7 @@ export class UserPromptManager {
             captured: row.captured === 1,
             userLearningCaptured: row.user_learning_captured === 1,
             linkedMemoryId: row.linked_memory_id,
+            capture_attempts: row.capture_attempts || 0,
         };
     }
 }

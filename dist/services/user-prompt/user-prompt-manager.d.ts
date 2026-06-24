@@ -8,6 +8,7 @@ export interface UserPrompt {
     captured: boolean;
     userLearningCaptured: boolean;
     linkedMemoryId: string | null;
+    capture_attempts: number;
 }
 export declare class UserPromptManager {
     private db;
@@ -19,6 +20,7 @@ export declare class UserPromptManager {
     deletePrompt(promptId: string): void;
     markAsCaptured(promptId: string): void;
     claimPrompt(promptId: string): boolean;
+    recordFailedAttempt(promptId: string): void;
     /**
      * Release a previously claimed prompt back to the pending state so it can
      * be retried by a future capture cycle. Used when capture aborts before
